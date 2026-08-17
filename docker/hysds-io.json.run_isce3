@@ -1,0 +1,42 @@
+{
+  "submission_type": "iteration",
+  "params": [
+    {
+      "name": "runconfig_s3",
+      "from": "submitter",
+      "type": "text",
+      "description": "path to the runconfig YAML containing s3:// links",
+      "default": ""
+    },
+    {
+      "name": "netrc_content",
+      "from": "submitter",
+      "type": "text",
+      "description": "netrc credentials text (machine/login/password)",
+      "default": ""
+    },
+    {
+      "name": "output_dir",
+      "from": "submitter",
+      "type": "text",
+      "description": "SAS product output directory",
+      "default": "output"
+    },
+    {
+      "name": "scratch_dir",
+      "from": "submitter",
+      "type": "text",
+      "description": "SAS scratch directory",
+      "default": "scratch"
+    },
+    {
+      "name": "localized_runconfig",
+      "from": "submitter",
+      "type": "text",
+      "description": "written localized runconfig",
+      "default": "runconfig_localized.yaml"
+    }
+  ],
+  "component": "tosca",
+  "label": "ISCE3 PGE"
+}
