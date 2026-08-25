@@ -28,7 +28,7 @@ WORKDIR $HOME
 
 # 3. Copy and setup installation script and version file
 COPY install-isce3.py $HOME/
-COPY isce3-version.txt $HOME/
+COPY docker/isce3-version.txt $HOME/
 RUN chmod +x $HOME/install-isce3.py
 
 # 4. Install base conda dependencies needed by script
@@ -84,7 +84,7 @@ ENV HOME=/home/jovyan \
     CONDA_DIR=/opt/conda \
     PATH=/opt/conda/bin:$PATH \
     ISCE3_INSTALL_DIR=/home/jovyan/isce3/build \
-    NOTEBOOK_PGE_DIR=/home/jovyan/nisar-isce3-pge/notebook-pges \
+    NOTEBOOK_PGE_DIR=/home/jovyan/nisar-isce3-pge/notebook_pges \
     NISAR_ONDEMAND_SRC=/home/jovyan/ondemand-resources/src
 
 # 1. Setup User and Runtime Deps
