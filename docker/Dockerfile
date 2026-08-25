@@ -33,7 +33,7 @@ RUN chmod +x $HOME/install-isce3.py
 
 # 4. Install base conda dependencies needed by script
 RUN mamba install -n base -y -c conda-forge \
-    nb_conda_kernels ipykernel papermill git cmake make \
+    nb_conda_kernels ipykernel papermill git cmake make kernda \
     && mamba clean --all -f -y
 
 # 5. Run ISCE3 installation (clones repo, creates env, builds, installs)
