@@ -1,0 +1,25 @@
+# Optional configuration for scripts/submit_isce3_job.py
+#
+# This file is OPTIONAL. Host, authentication, and TLS settings all come from
+# otello's own config at ~/.config/otello/config.yml -- shared by both the PGE
+# build/register endpoint call and the job submission.
+#
+# The queue is normally auto-selected from the runconfig's workflow (RSLC ->
+# rslc queue, GCOV -> gcov queue, GUNW/INSAR -> insar-{gpu,cpu} queue, etc.).
+# This file only exists to override that when you need to.
+#
+#     mkdir -p ~/.config/nisar-isce3-submit
+#     cp config/submit_config.example.yml ~/.config/nisar-isce3-submit/config.yml
+#
+# Resolution order: --config <path>  ->  $NISAR_ISCE3_SUBMIT_CONFIG  ->
+# ~/.config/nisar-isce3-submit/config.yml. A missing file is fine.
+
+# Per-workflow queue overrides. Any workflow you list here replaces the built-in
+# queue for that workflow; omit a workflow to keep its default. Values are used
+# verbatim (no gpu/cpu suffixing).
+queues:
+  focus: nisar-job_worker-sciflo-rslc
+  gslc: nisar-job_worker-sciflo-gslc
+  gcov: nisar-job_worker-sciflo-gcov
+  sme2: nisar-job_worker-sciflo-sme2
+  insar: nisar-job_worker-sciflo-insar-cpu
