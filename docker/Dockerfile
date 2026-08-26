@@ -57,12 +57,9 @@ RUN set -ex \
 
 # 7. Install NISAR on-demand tooling (nisar_products: runconfig localizer, naming, S3).
 #    Pulls in boto3/geopandas/numpy/pyyaml/shapely + earthaccess for netrc-based DAAC auth.
-#    Download from S3 instead of cloning from enterprise GitHub (no VPN needed).
+#    Clone from enterprise GitHub (assumed reachable from the build host / VPN).
 RUN set -ex \
-    && (curl -fsSL https://nisar-adt-cc-ondemand.s3.amazonaws.com/ondemand-resources.tar.gz -o /tmp/ondemand-resources.tar.gz || \
-        curl -fsSL https://nisar-st-cc-ondemand.s3.amazonaws.com/ondemand-resources.tar.gz -o /tmp/ondemand-resources.tar.gz) \
-    && tar -xzf /tmp/ondemand-resources.tar.gz -C $HOME \
-    && rm /tmp/ondemand-resources.tar.gz \
+    && git clone --depth 1 https://github.jpl.nasa.gov/NISAR-ODS/ondemand-resources.git $HOME/ondemand-resources \
     && mamba run -n isce3_src pip install "$HOME/ondemand-resources[earthaccess]"
 
 # 8. Re-patch the isce3_src kernel so its kernel.json carries the ISCE3 build env vars
