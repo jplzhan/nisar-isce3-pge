@@ -100,6 +100,18 @@ RUN set -ex \
 # 2. COPY Artifacts from Builder
 # This copies BOTH environments (base and isce3_src) because they live inside /opt/conda
 COPY --from=builder /opt/conda /opt/conda
+
+# 2a. Pin /opt/conda/envs into conda's envs_dirs via the SYSTEM condarc.
+# install-isce3.py runs `conda config --append envs_dirs /opt/conda/envs`, but the
+# default target is the builder's ~/.condarc (/home/jovyan/.condarc) -- which is NOT
+# copied into this runtime stage. Without it, `conda run -n isce3_src` resolves the
+# NAME against whatever envs_dirs the runtime HOME/conda produces (on a HySDS worker
+# that is ~/.conda/envs), so it fails with `EnvironmentLocationNotFound:
+# ~/.conda/envs/isce3_src` even though the env is at /opt/conda/envs/isce3_src.
+# The system condarc (/opt/conda/.condarc) travels with the /opt/conda copy above and
+# is read independent of HOME, so `-n isce3_src` resolves correctly everywhere.
+RUN conda config --system --prepend envs_dirs /opt/conda/envs \
+    && conda config --system --show envs_dirs
 # ISCE3 installs into its build tree, not /opt/isce3. Copy the runtime pieces
 # (python packages + shared libs) to the SAME path the isce3_src env vars and the
 # kernda-patched kernel.json expect: /home/jovyan/isce3/build/{packages,lib64}.
