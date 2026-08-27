@@ -5,7 +5,7 @@
       "name": "runconfig_s3",
       "from": "submitter",
       "type": "text",
-      "description": "path to the runconfig YAML containing s3:// links",
+      "description": "inline runconfig YAML text (containing s3:// links), or a local path",
       "default": ""
     },
     {
