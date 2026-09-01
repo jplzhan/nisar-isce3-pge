@@ -32,6 +32,14 @@
     {
       "name": "localized_runconfig",
       "destination": "context"
+    },
+    {
+      "name": "mozart_url",
+      "destination": "context"
+    },
+    {
+      "name": "mozart_auth",
+      "destination": "context"
     }
   ]
 }
