@@ -126,7 +126,15 @@ def queue_for_runconfig(runconfig_text: str, config: dict) -> str:
         gpu = bool(cfg["runconfig"]["groups"].get("worker", {}).get("gpu_enabled"))
         # Only auto-suffix the built-in name; a full override is used verbatim.
         if queue == WORKFLOW_QUEUES["insar"]:
-            queue = f"{queue}-{'gpu' if gpu else 'cpu'}"
+            if gpu:
+                queue = f"{queue}-gpu"
+            else:
+                # Route CPU InSAR to the GCOV queue: the instance type behind
+                # nisar-job_worker-sciflo-insar-cpu appears insufficient (memory/
+                # cores) for the InSAR SAS, whereas the GCOV queue's instances
+                # handle it. Restore the dedicated CPU queue once it is resized.
+                queue = f"{queue}-cpu"
+                #queue = WORKFLOW_QUEUES["gcov"]
     log(f"workflow={workflow} -> queue={queue}")
     return queue
 
@@ -161,6 +169,28 @@ def resolve_and_build(mozart, version: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Mozart submission
 # --------------------------------------------------------------------------- #
+def mozart_endpoint_params(mozart) -> tuple:
+    """Return (mozart_url, mozart_auth) for the worker's DAAC-creds callback.
+
+    The worker has no public internet, so it cannot mint DAAC S3 credentials via
+    earthaccess directly; instead the notebook POSTs the netrc to Mozart's
+    `/mozart/api/v0.1/daac/s3credentials` endpoint on the internal subnet. We hand
+    the worker the same host + basic-auth otello already resolved for this session
+    (from ~/.config/otello/config.yml -> AWS Secrets or an inline password), so no
+    extra secret has to be configured. Returns ("", "") if either is unavailable;
+    the notebook treats an empty mozart_url as "skip the callback".
+    """
+    url = (mozart._cfg.get("host") or "").rstrip("/")
+    auth = getattr(mozart._session, "auth", None)
+    auth_str = ""
+    if isinstance(auth, (tuple, list)) and len(auth) == 2 and all(auth):
+        auth_str = f"{auth[0]}:{auth[1]}"
+    elif url:
+        log("WARNING: otello session has no basic-auth; sending empty mozart_auth "
+            "(the DAAC cred endpoint call will be unauthenticated)")
+    return url, auth_str
+
+
 def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
                explicit_queue: str, config: dict, priority: int, wait: bool):
     """Submit job-run_isce3:<branch> to Mozart with an inline runconfig.
@@ -177,12 +207,18 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
 
     queue = explicit_queue or queue_for_runconfig(runconfig_text, config)
 
+    mozart_url, mozart_auth = mozart_endpoint_params(mozart)
+    log(f"mozart DAAC-creds callback: url={mozart_url or '(none)'} "
+        f"auth={'set' if mozart_auth else '(none)'}")
+
     jt.set_input_params({
         "runconfig_s3": runconfig_text,     # inline YAML text (see notebook write-cell)
         "netrc_content": netrc_text,        # earthdata creds for DAAC S3 access
         "output_dir": "output",
         "scratch_dir": "scratch",
         "localized_runconfig": "runconfig_localized.yaml",
+        "mozart_url": mozart_url,           # worker calls this to mint DAAC creds
+        "mozart_auth": mozart_auth,         # basic-auth for that call (user:password)
     })
 
     log(f"submitting to queue {queue} (priority {priority})")
