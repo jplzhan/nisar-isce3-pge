@@ -37,17 +37,10 @@
       "default": "runconfig_localized.yaml"
     },
     {
-      "name": "mozart_url",
+      "name": "mozart_pvt_ip",
       "from": "submitter",
       "type": "text",
-      "description": "Mozart base URL used to mint DAAC S3 creds when the worker has no internet (auto-filled from otello config)",
-      "default": ""
-    },
-    {
-      "name": "mozart_auth",
-      "from": "submitter",
-      "type": "text",
-      "description": "Mozart basic-auth 'username:password' for the DAAC cred endpoint (auto-filled from otello config)",
+      "description": "Mozart private IP; worker mints DAAC S3 creds via https://<ip>:8888/api/v0.1/daac/s3credentials when it has no public internet",
       "default": ""
     }
   ],

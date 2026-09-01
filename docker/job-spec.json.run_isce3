@@ -34,11 +34,7 @@
       "destination": "context"
     },
     {
-      "name": "mozart_url",
-      "destination": "context"
-    },
-    {
-      "name": "mozart_auth",
+      "name": "mozart_pvt_ip",
       "destination": "context"
     }
   ]

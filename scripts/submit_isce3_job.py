@@ -62,6 +62,12 @@ OTELLO_PKG = os.path.expanduser("~/otello")
 # Mozart endpoint that builds/registers the ISCE3 PGE image for a version.
 PGE_ISCE3_ENDPOINT = "mozart/api/v0.1/pge/isce3"
 
+# Default Mozart private IP is read from an on-demand config object in S3. The
+# bucket is venue-suffixed; try "st" first, then "adt". The object is JSON with a
+# "MOZART_PVT_IP" key. Overridden by --mozart-pvt-ip.
+MOZART_CONFIG_VENUES = ("st", "adt")
+MOZART_CONFIG_KEY = "ondemand-test/mozart_config.json"
+
 
 def log(msg: str) -> None:
     print(f"[submit_isce3_job] {msg}", flush=True)
@@ -133,8 +139,8 @@ def queue_for_runconfig(runconfig_text: str, config: dict) -> str:
                 # nisar-job_worker-sciflo-insar-cpu appears insufficient (memory/
                 # cores) for the InSAR SAS, whereas the GCOV queue's instances
                 # handle it. Restore the dedicated CPU queue once it is resized.
-                queue = f"{queue}-cpu"
-                #queue = WORKFLOW_QUEUES["gcov"]
+                #queue = f"{queue}-cpu"
+                queue = WORKFLOW_QUEUES["gcov"]
     log(f"workflow={workflow} -> queue={queue}")
     return queue
 
@@ -169,36 +175,54 @@ def resolve_and_build(mozart, version: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Mozart submission
 # --------------------------------------------------------------------------- #
-def mozart_endpoint_params(mozart) -> tuple:
-    """Return (mozart_url, mozart_auth) for the worker's DAAC-creds callback.
+def resolve_mozart_pvt_ip() -> str:
+    """Read the Mozart private IP from the on-demand config object in S3.
 
-    The worker has no public internet, so it cannot mint DAAC S3 credentials via
-    earthaccess directly; instead the notebook POSTs the netrc to Mozart's
-    `/mozart/api/v0.1/daac/s3credentials` endpoint on the internal subnet. We hand
-    the worker the same host + basic-auth otello already resolved for this session
-    (from ~/.config/otello/config.yml -> AWS Secrets or an inline password), so no
-    extra secret has to be configured. Returns ("", "") if either is unavailable;
-    the notebook treats an empty mozart_url as "skip the callback".
+    Tries each venue bucket in ``MOZART_CONFIG_VENUES`` order
+    (s3://nisar-<venue>-cc-ondemand/<MOZART_CONFIG_KEY>) and returns the first
+    ``MOZART_PVT_IP`` found. Returns "" if none is readable (submit still works;
+    the notebook just skips the DAAC credential fetch). Never raises.
     """
-    url = (mozart._cfg.get("host") or "").rstrip("/")
-    auth = getattr(mozart._session, "auth", None)
-    auth_str = ""
-    if isinstance(auth, (tuple, list)) and len(auth) == 2 and all(auth):
-        auth_str = f"{auth[0]}:{auth[1]}"
-    elif url:
-        log("WARNING: otello session has no basic-auth; sending empty mozart_auth "
-            "(the DAAC cred endpoint call will be unauthenticated)")
-    return url, auth_str
+    import json
+
+    try:
+        import boto3
+    except Exception as exc:  # noqa: BLE001
+        log(f"WARNING: boto3 unavailable, cannot read Mozart config from S3: {exc}")
+        return ""
+
+    s3 = boto3.client("s3")
+    for venue in MOZART_CONFIG_VENUES:
+        bucket = f"nisar-{venue}-cc-ondemand"
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=MOZART_CONFIG_KEY)
+            body = json.loads(obj["Body"].read())
+            ip = (body.get("MOZART_PVT_IP") or "").strip()
+            if ip:
+                log(f"resolved mozart_pvt_ip={ip} from s3://{bucket}/{MOZART_CONFIG_KEY}")
+                return ip
+            log(f"WARNING: s3://{bucket}/{MOZART_CONFIG_KEY} has no MOZART_PVT_IP")
+        except Exception as exc:  # noqa: BLE001 -- 403/404/parse: try next venue
+            log(f"mozart config not available at s3://{bucket}/{MOZART_CONFIG_KEY}: {exc}")
+    log("WARNING: could not resolve mozart_pvt_ip from any venue; "
+        "worker will skip the DAAC credential fetch")
+    return ""
 
 
 def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
-               explicit_queue: str, config: dict, priority: int, wait: bool):
+               explicit_queue: str, config: dict, priority: int, wait: bool,
+               mozart_pvt_ip: str = None):
     """Submit job-run_isce3:<branch> to Mozart with an inline runconfig.
 
     Queue precedence: --queue (explicit_queue) -> workflow-matched queue derived
     from the runconfig. The workflow queues always exist (guaranteed by the
     deployment); Mozart only *lists* queues it has exercised at least once, so we
     do not validate against that list -- submitting exercises the queue.
+
+    ``mozart_pvt_ip`` is passed to the worker so it can mint short-term DAAC S3
+    credentials directly from the Mozart gunicorn API on :8888 (bypassing the
+    httpd basic-auth proxy). It has no public internet, so this is how it gets
+    DAAC access. Empty -> the notebook skips the credential fetch.
     """
     job_name = f"job-run_isce3:{branch}"
     log(f"getting job type {job_name}")
@@ -207,9 +231,9 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
 
     queue = explicit_queue or queue_for_runconfig(runconfig_text, config)
 
-    mozart_url, mozart_auth = mozart_endpoint_params(mozart)
-    log(f"mozart DAAC-creds callback: url={mozart_url or '(none)'} "
-        f"auth={'set' if mozart_auth else '(none)'}")
+    # --mozart-pvt-ip wins; otherwise read the default from the S3 config object.
+    mozart_pvt_ip = (mozart_pvt_ip or "").strip() or resolve_mozart_pvt_ip()
+    log(f"mozart DAAC-creds callback: pvt_ip={mozart_pvt_ip or '(none)'}")
 
     jt.set_input_params({
         "runconfig_s3": runconfig_text,     # inline YAML text (see notebook write-cell)
@@ -217,8 +241,7 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
         "output_dir": "output",
         "scratch_dir": "scratch",
         "localized_runconfig": "runconfig_localized.yaml",
-        "mozart_url": mozart_url,           # worker calls this to mint DAAC creds
-        "mozart_auth": mozart_auth,         # basic-auth for that call (user:password)
+        "mozart_pvt_ip": mozart_pvt_ip,     # worker mints DAAC creds via :8888
     })
 
     log(f"submitting to queue {queue} (priority {priority})")
@@ -252,6 +275,12 @@ def main() -> int:
                         help="Mozart queue (default: auto-selected from the "
                              "runconfig workflow, e.g. GUNW/INSAR -> "
                              "nisar-job_worker-sciflo-insar-{gpu,cpu})")
+    parser.add_argument("--mozart-pvt-ip",
+                        help="Mozart private IP the worker calls to mint DAAC S3 "
+                             "creds, via https://<ip>:8888/api/v0.1/daac/s3credentials "
+                             "(the worker has no public internet). Default: read "
+                             "MOZART_PVT_IP from s3://nisar-{st,adt}-cc-ondemand/"
+                             + MOZART_CONFIG_KEY + ".")
     parser.add_argument("--priority", type=int, default=1,
                         help="Mozart job priority 1-9 (default: 1)")
     parser.add_argument("--wait", action="store_true",
@@ -306,7 +335,8 @@ def main() -> int:
         log(f"netrc not found at {args.netrc}; submitting empty netrc_content")
 
     submit_job(mozart, branch, runconfig_text, netrc_text,
-               args.queue, cfg, args.priority, args.wait)
+               args.queue, cfg, args.priority, args.wait,
+               mozart_pvt_ip=args.mozart_pvt_ip)
     return 0
 
 
