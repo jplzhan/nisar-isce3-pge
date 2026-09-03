@@ -21,13 +21,24 @@ by the endpoint call and the job submission). An optional submit config
 
 Modeled on ~/alos-to-insar/run.py and pcm.py (passing config file *contents* as
 inline strings).
+
+Tracking
+--------
+Each submission is given a readable tag (``nisar-isce3-<product>-<UTC timestamp>``)
+and a record JSON in ~/.nisar-isce3-jobs (override with $NISAR_ISCE3_JOBS_DIR). The
+end-of-run summary prints the exact ``check_isce3_job.py`` command to check status
+and locate the final output products.
 """
 
 import argparse
 import os
+import re
 import sys
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from job_records import make_tag, setup_logging, write_record  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Defaults
@@ -69,8 +80,30 @@ MOZART_CONFIG_VENUES = ("st", "adt")
 MOZART_CONFIG_KEY = "ondemand-test/mozart_config.json"
 
 
+logger = setup_logging("submit")
+
+
 def log(msg: str) -> None:
-    print(f"[submit_isce3_job] {msg}", flush=True)
+    """Thin INFO-level shim over the module logger (kept so call sites stay terse)."""
+    logger.info(msg)
+
+
+def product_name_from_cfg(cfg: dict) -> str:
+    """Derive a readable product name for tagging from a parsed runconfig.
+
+    Prefer the partial_granule_id prefix (up to the first token placeholder) so the
+    tag reflects the actual granule family; fall back to the product_type.
+    """
+    try:
+        primary = cfg["runconfig"]["groups"]["primary_executable"]
+    except (KeyError, TypeError):
+        return "job"
+    pgid = primary.get("partial_granule_id")
+    if isinstance(pgid, str) and pgid:
+        prefix = pgid.split("{", 1)[0].strip("_")
+        if prefix:
+            return prefix
+    return primary.get("product_type") or "job"
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +120,56 @@ def load_config(path: str = None) -> dict:
         cfg = yaml.safe_load(f) or {}
     log(f"loaded config: {resolved}")
     return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Composite release ID (CRID) letter normalization
+# --------------------------------------------------------------------------- #
+# The CRID is always 1 capital letter + 5 digits (e.g. P05023, X01000). Only S
+# and A are allowed as the leading letter on the cluster; anything else must be
+# rewritten before submission, including its embedded use in partial_granule_id
+# (which becomes the output product name).
+ALLOWED_CRID_LETTERS = ("S", "A")
+CRID_RE = re.compile(r"^[A-Z][0-9]{5}$")
+
+
+def normalize_crid(runconfig_text: str, allowed_letter: str) -> str:
+    """Rewrite the runconfig CRID's leading letter to ``allowed_letter`` if needed.
+
+    Reads composite_release_id from runconfig.groups.primary_executable, validates
+    it as <1 capital letter><5 digits>, and if its leading letter is not S/A,
+    replaces every occurrence of the token in the raw YAML text (the
+    composite_release_id field AND the partial_granule_id / output name). Operates
+    on raw text to avoid reserializing/reordering the YAML. Raises SystemExit on a
+    missing or malformed CRID.
+    """
+    cfg = yaml.safe_load(runconfig_text) or {}
+    try:
+        primary = cfg["runconfig"]["groups"]["primary_executable"]
+    except (KeyError, TypeError):
+        raise SystemExit(
+            "cannot normalize CRID: runconfig.groups.primary_executable not found"
+        )
+    old_crid = primary.get("composite_release_id")
+
+    if not isinstance(old_crid, str) or not CRID_RE.match(old_crid):
+        raise SystemExit(
+            f"invalid composite_release_id {old_crid!r}: expected 1 capital letter "
+            "followed by 5 digits (e.g. S05023). Fix composite_release_id in the "
+            "runconfig under groups.primary_executable and resubmit."
+        )
+
+    if old_crid[0] in ALLOWED_CRID_LETTERS:
+        log(f"composite_release_id {old_crid} already allowed; leaving unchanged")
+        return runconfig_text
+
+    new_crid = allowed_letter + old_crid[1:]
+    # Plain substring replace: the CRID is embedded as ..._P05023_... in
+    # partial_granule_id, where a \b word boundary would fail ('_' is a word char).
+    count = runconfig_text.count(old_crid)
+    new_text = runconfig_text.replace(old_crid, new_crid)
+    log(f"composite_release_id {old_crid} -> {new_crid} ({count} occurrence(s) replaced)")
+    return new_text
 
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +294,8 @@ def resolve_mozart_pvt_ip() -> str:
 
 def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
                explicit_queue: str, config: dict, priority: int, wait: bool,
-               mozart_pvt_ip: str = None):
+               mozart_pvt_ip: str = None, version: str = None,
+               runconfig_path: str = None):
     """Submit job-run_isce3:<branch> to Mozart with an inline runconfig.
 
     Queue precedence: --queue (explicit_queue) -> workflow-matched queue derived
@@ -223,12 +307,16 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
     credentials directly from the Mozart gunicorn API on :8888 (bypassing the
     httpd basic-auth proxy). It has no public internet, so this is how it gets
     DAAC access. Empty -> the notebook skips the credential fetch.
+
+    Every submission is given a readable ``tag`` (nisar-isce3-<product>-<timestamp>)
+    and a local record JSON so it can be found later with check_isce3_job.py.
     """
     job_name = f"job-run_isce3:{branch}"
     log(f"getting job type {job_name}")
     jt = mozart.get_job_type(job_name)
     jt.initialize()
 
+    cfg = yaml.safe_load(runconfig_text) or {}
     queue = explicit_queue or queue_for_runconfig(runconfig_text, config)
 
     # --mozart-pvt-ip wins; otherwise read the default from the S3 config object.
@@ -244,10 +332,42 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
         "mozart_pvt_ip": mozart_pvt_ip,     # worker mints DAAC creds via :8888
     })
 
-    log(f"submitting to queue {queue} (priority {priority})")
-    job = jt.submit_job(queue=queue, priority=priority)
+    tag = make_tag(product_name_from_cfg(cfg))
+    log(f"submitting to queue {queue} (priority {priority}) tag={tag}")
+    job = jt.submit_job(queue=queue, priority=priority, tag=tag)
     job_id = getattr(job, "job_id", None) or getattr(job, "_id", None)
     log(f"submitted. job id: {job_id}")
+
+    # Persist a record so the job can be found again by check_isce3_job.py.
+    try:
+        primary = cfg.get("runconfig", {}).get("groups", {}).get("primary_executable", {})
+    except AttributeError:
+        primary = {}
+    record = {
+        "tag": tag,
+        "job_id": job_id,
+        "product_type": primary.get("product_type"),
+        "composite_release_id": primary.get("composite_release_id"),
+        "queue": queue,
+        "branch": branch,
+        "version": version,
+        "priority": priority,
+        "runconfig_path": os.path.abspath(runconfig_path) if runconfig_path else None,
+        "host": mozart._cfg.get("host"),
+        "username": mozart._cfg.get("username"),
+    }
+    record_file = write_record(record)
+
+    # Summary block: everything needed to track the job later, in one place.
+    check = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_isce3_job.py")
+    log("=" * 70)
+    log("SUBMITTED")
+    log(f"  tag        : {tag}")
+    log(f"  job id     : {job_id}")
+    log(f"  queue      : {queue}")
+    log(f"  record     : {record_file}")
+    log(f"  check with : python3 {check} --tag {tag}")
+    log("=" * 70)
 
     if wait:
         log("waiting for job completion...")
@@ -281,6 +401,12 @@ def main() -> int:
                              "(the worker has no public internet). Default: read "
                              "MOZART_PVT_IP from s3://nisar-{st,adt}-cc-ondemand/"
                              + MOZART_CONFIG_KEY + ".")
+    parser.add_argument("--crid-letter", choices=list(ALLOWED_CRID_LETTERS),
+                        default="S",
+                        help="allowed leading letter for the composite release ID; "
+                             "a runconfig CRID starting with any other letter (e.g. "
+                             "P/X) is rewritten to this before submission, including "
+                             "in the output product name (default: S)")
     parser.add_argument("--priority", type=int, default=1,
                         help="Mozart job priority 1-9 (default: 1)")
     parser.add_argument("--wait", action="store_true",
@@ -325,6 +451,7 @@ def main() -> int:
     with open(args.runconfig) as f:
         runconfig_text = f.read()
     log(f"runconfig: {args.runconfig} ({len(runconfig_text)} bytes)")
+    runconfig_text = normalize_crid(runconfig_text, args.crid_letter)
 
     netrc_text = ""
     if os.path.exists(args.netrc):
@@ -336,7 +463,8 @@ def main() -> int:
 
     submit_job(mozart, branch, runconfig_text, netrc_text,
                args.queue, cfg, args.priority, args.wait,
-               mozart_pvt_ip=args.mozart_pvt_ip)
+               mozart_pvt_ip=args.mozart_pvt_ip,
+               version=args.version, runconfig_path=args.runconfig)
     return 0
 
 
