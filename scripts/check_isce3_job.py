@@ -17,6 +17,14 @@ Modes:
   one-shot (default)  : print status once and exit
   --watch             : poll until the job reaches a terminal state, then report
 
+Finding output products:
+When a job completes, GRQ reports each product's S3 location directly. The granule
+name is only finalized by the SAS, but the submit record keeps the
+partial_granule_id template, so --search can also LOCATE the products by listing
+the S3 output tree for the product family and matching the filled granule name
+against the template. --search works even before GRQ has published, and falls back
+automatically when GRQ lists nothing. --venue narrows the search to one venue.
+
 Exit codes (handy for scripting/CI):
   0  completed
   2  failed / offline
@@ -26,6 +34,7 @@ Exit codes (handy for scripting/CI):
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -37,9 +46,15 @@ from job_records import (  # noqa: E402
     setup_logging,
 )
 
+from product_search import (  # noqa: E402
+    expected_s3_prefix,
+    find_products_by_prefix,
+)
+
 OTELLO_PKG = os.path.expanduser("~/otello")
 
 POLL_SECONDS = 30
+
 TERMINAL = {"job-completed", "job-failed", "job-deduped", "job-offline"}
 FRIENDLY = {
     "job-queued": "queued",
@@ -115,8 +130,43 @@ def resolve_job(otello, mozart, args):
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
+def _clean_s3_url(url: str) -> str:
+    """Normalize HySDS's endpoint-style S3 URL to plain s3://<bucket>/<key>.
+
+    GRQ returns e.g. ``s3://s3-us-west-2.amazonaws.com:80/<bucket>/<key>``; the host
+    segment is the S3 endpoint, not the bucket. Strip it so the first path segment
+    (the real bucket) leads. Non-S3 or already-clean URLs are returned unchanged.
+    """
+    if not url.startswith("s3://"):
+        return url
+    rest = url[len("s3://"):]
+    host, _, tail = rest.partition("/")
+    # host looks like an S3 endpoint (contains amazonaws.com or a :port) -> drop it.
+    if tail and ("amazonaws.com" in host or ":" in host):
+        return "s3://" + tail
+    return url
+
+
+def _s3_urls(product: dict) -> list:
+    """Return the cleaned s3:// URLs from a product doc's urls (product data only)."""
+    out = []
+    vals = product.get("urls") or []
+    if isinstance(vals, str):
+        vals = [vals]
+    for v in vals:
+        if isinstance(v, str) and v.startswith("s3://"):
+            out.append(_clean_s3_url(v))
+    return out
+
+
+def _venue_from_bucket(s3_url: str) -> str:
+    """Extract <venue> from an s3://nisar-<venue>-rs-ondemand/... URL, or None."""
+    m = re.match(r"s3://nisar-([a-z0-9]+)-rs-ondemand/", s3_url or "")
+    return m.group(1) if m else None
+
+
 def report_products(job):
-    """Log the generated products (identifier + URLs / S3 paths)."""
+    """Log the generated products (identifier + normalized S3 / browse URLs)."""
     try:
         products = job.get_generated_products()
     except Exception as exc:  # noqa: BLE001
@@ -128,12 +178,53 @@ def report_products(job):
     logger.info(f"{len(products)} product(s):")
     for p in products:
         pid = p.get("id") or p.get("_id") or "(unknown id)"
-        logger.info(f"  - {pid}")
-        urls = p.get("urls") or []
-        if isinstance(urls, str):
-            urls = [urls]
-        for u in urls:
-            logger.info(f"      {u}")
+        dataset = p.get("dataset") or p.get("ipath") or ""
+        logger.info(f"  - {pid}" + (f"  [{dataset}]" if dataset else ""))
+        # The s3:// output location reported by GRQ (authoritative).
+        s3 = _s3_urls(p)
+        for u in s3:
+            logger.info(f"      output: {u}")
+        if not s3:
+            urls = p.get("urls") or []
+            if isinstance(urls, str):
+                urls = [urls]
+            for u in urls:
+                logger.info(f"      {u}")
+        # Cross-check against the granule-derived canonical prefix. Venue comes
+        # from the reported bucket; if GRQ gave no s3 url we cannot know the venue.
+        venue = _venue_from_bucket(s3[0]) if s3 else None
+        if venue:
+            derived = expected_s3_prefix(pid, venue)
+            if derived:
+                logger.info(f"      expected prefix: {derived}")
+    return len(products)
+
+
+def report_products_by_search(record, venue=None):
+    """Locate staged products in S3 by matching the record's partial_granule_id.
+
+    Fallback for when GRQ has not listed products yet (or no local record maps to a
+    job): we know the granule prefix + product family from the submitted
+    partial_granule_id, so list the S3 output tree and match the filled name.
+    Returns the number of matches found.
+    """
+    if not record:
+        logger.info("no local record; cannot search S3 by granule prefix")
+        return 0
+    template = record.get("partial_granule_id")
+    if not template:
+        logger.info("record has no partial_granule_id; cannot search S3 by prefix")
+        return 0
+    logger.info(f"searching S3 output for granule prefix "
+                f"{template.split('{', 1)[0]!r}...")
+    hits = find_products_by_prefix(template, venue=venue)
+    if not hits:
+        logger.info("no matching products found in S3 (job may not have published yet)")
+        return 0
+    logger.info(f"{len(hits)} matching product(s) in S3:")
+    for h in hits:
+        logger.info(f"  - {h}")
+    return len(hits)
 
 
 def report_failure(job, dump_traceback):
@@ -151,24 +242,24 @@ def report_failure(job, dump_traceback):
         logger.info("re-run with --traceback for the full worker traceback")
 
 
-def report(job, status, args):
+def report(job, status, args, record=None):
     """Log a status line + products/failure detail. Returns an exit code."""
     friendly = FRIENDLY.get(status, status)
     logger.info(f"status: {friendly} [{status}]  job_id={job.job_id}")
 
-    if status == "job-completed":
-        report_products(job)
+    if status in ("job-completed", "job-deduped"):
+        n = report_products(job)
+        # If GRQ listed nothing (or --search forced), fall back to an S3 prefix
+        # search using the submitted partial_granule_id template.
+        if (not n or args.search) and record:
+            report_products_by_search(record, venue=args.venue)
         return 0
     if status in ("job-failed", "job-offline"):
         report_failure(job, args.traceback)
         return 2
-    if status == "job-deduped":
-        # Deduped: an identical job already produced the products.
-        report_products(job)
-        return 0
     # queued / started
-    if args.products:
-        report_products(job)
+    if args.products or args.search:
+        report_products_by_search(record, venue=args.venue)
     return 3
 
 
@@ -188,6 +279,13 @@ def main() -> int:
                         help=f"poll every {POLL_SECONDS}s until the job is terminal")
     parser.add_argument("--products", action="store_true",
                         help="also list products even if the job is not yet complete")
+    parser.add_argument("--search", action="store_true",
+                        help="find output products in S3 by matching the submitted "
+                             "partial_granule_id prefix (uses the local record). "
+                             "Works before GRQ lists products; can run standalone "
+                             "with --tag/--record and no Mozart status check.")
+    parser.add_argument("--venue", help="limit the S3 product search to one venue "
+                                        "(e.g. st, adt); default: probe all")
     parser.add_argument("--traceback", action="store_true",
                         help="on failure, dump the full worker traceback")
     parser.add_argument("--list", action="store_true",
@@ -220,7 +318,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             logger.error(f"could not get status for job {job.job_id}: {exc}")
             return 4
-        return report(job, status, args)
+        return report(job, status, args, record=record)
 
     # Watch until terminal.
     logger.info(f"watching job {job.job_id} (poll every {POLL_SECONDS}s)...")
@@ -232,7 +330,7 @@ def main() -> int:
             time.sleep(POLL_SECONDS)
             continue
         if status in TERMINAL:
-            return report(job, status, args)
+            return report(job, status, args, record=record)
         logger.info(f"status: {FRIENDLY.get(status, status)} [{status}]")
         time.sleep(POLL_SECONDS)
 

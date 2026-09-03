@@ -28,6 +28,15 @@ Each submission is given a readable tag (``nisar-isce3-<product>-<UTC timestamp>
 and a record JSON in ~/.nisar-isce3-jobs (override with $NISAR_ISCE3_JOBS_DIR). The
 end-of-run summary prints the exact ``check_isce3_job.py`` command to check status
 and locate the final output products.
+
+Product counter
+---------------
+Before submitting, the granule prefix is searched in the S3 output buckets. If
+products for this granule already exist, the product counter (the trailing ``_NNN``
+in the output name, plus the ``product_counter`` field) is bumped to the next value
+so the rerun does not clobber a prior product and a later prefix search matches only
+this job's output. The bump is confirmed interactively unless ``--yes``; use
+``--no-counter-bump`` to submit at the runconfig's current counter regardless.
 """
 
 import argparse
@@ -39,6 +48,10 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from job_records import make_tag, setup_logging, write_record  # noqa: E402
+from product_search import (  # noqa: E402
+    find_existing_counters,
+    set_product_counter,
+)
 
 # --------------------------------------------------------------------------- #
 # Defaults
@@ -170,6 +183,70 @@ def normalize_crid(runconfig_text: str, allowed_letter: str) -> str:
     new_text = runconfig_text.replace(old_crid, new_crid)
     log(f"composite_release_id {old_crid} -> {new_crid} ({count} occurrence(s) replaced)")
     return new_text
+
+
+# --------------------------------------------------------------------------- #
+# Product-counter collision check
+# --------------------------------------------------------------------------- #
+def _partial_granule_id(runconfig_text: str):
+    """Return partial_granule_id from a runconfig, or None."""
+    cfg = yaml.safe_load(runconfig_text) or {}
+    try:
+        return cfg["runconfig"]["groups"]["primary_executable"].get("partial_granule_id")
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+def resolve_product_counter(runconfig_text: str, assume_yes: bool,
+                            no_bump: bool, venue: str = None) -> str:
+    """Bump the product counter if outputs for this granule family already exist.
+
+    The output granule name ends in a product counter (``..._001``); each rerun
+    should increment it (002, 003, ...) so a new submission does not clobber a prior
+    product and so a later prefix search matches exactly this job's output. Before
+    submitting we list existing counters in S3 for the (CRID-normalized) granule
+    prefix:
+
+    - none exist -> submit unchanged.
+    - some exist -> compute next = max(existing)+1 and (unless ``assume_yes``)
+      prompt for confirmation. Declining, or ``no_bump``, submits at the runconfig's
+      current counter (which may clobber / produce ambiguous matches -- warned).
+
+    Returns the (possibly counter-rewritten) runconfig text.
+    """
+    pgid = _partial_granule_id(runconfig_text)
+    if not pgid:
+        log("no partial_granule_id in runconfig; skipping product-counter check")
+        return runconfig_text
+
+    existing = find_existing_counters(pgid, venue=venue)
+    if not existing:
+        log("no existing products match this granule prefix; product counter unchanged")
+        return runconfig_text
+
+    nxt = max(existing) + 1
+    existing_str = ", ".join(f"{c:03d}" for c in existing)
+    log(f"found existing product counter(s) [{existing_str}] for this granule prefix")
+
+    if no_bump:
+        log("WARNING: --no-counter-bump set; submitting at the runconfig's current "
+            "counter -- this may clobber an existing product or match >1 result")
+        return runconfig_text
+
+    if not assume_yes:
+        prompt = (f"Existing products found. Bump product counter to {nxt:03d} "
+                  f"before submitting? [Y/n] ")
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            answer = ""  # non-interactive without --yes -> default to bumping
+        if answer in ("n", "no"):
+            log("WARNING: not bumping counter (user declined); submitting at the "
+                "runconfig's current counter -- may clobber or match >1 result")
+            return runconfig_text
+
+    log(f"bumping product counter to {nxt:03d} (product_counter and granule suffix)")
+    return set_product_counter(runconfig_text, nxt)
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +425,7 @@ def submit_job(mozart, branch: str, runconfig_text: str, netrc_text: str,
         "job_id": job_id,
         "product_type": primary.get("product_type"),
         "composite_release_id": primary.get("composite_release_id"),
+        "partial_granule_id": primary.get("partial_granule_id"),
         "queue": queue,
         "branch": branch,
         "version": version,
@@ -409,6 +487,15 @@ def main() -> int:
                              "in the output product name (default: S)")
     parser.add_argument("--priority", type=int, default=1,
                         help="Mozart job priority 1-9 (default: 1)")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="auto-confirm bumping the product counter when existing "
+                             "products are found (no interactive prompt)")
+    parser.add_argument("--no-counter-bump", action="store_true",
+                        help="never bump the product counter, even if products for "
+                             "this granule already exist (may clobber / match >1)")
+    parser.add_argument("--venue",
+                        help="limit the pre-submit product-collision search to one "
+                             "venue (e.g. st, adt); default: probe all")
     parser.add_argument("--wait", action="store_true",
                         help="wait for the submitted Mozart job to complete")
     parser.add_argument("--only-build", action="store_true",
@@ -452,6 +539,13 @@ def main() -> int:
         runconfig_text = f.read()
     log(f"runconfig: {args.runconfig} ({len(runconfig_text)} bytes)")
     runconfig_text = normalize_crid(runconfig_text, args.crid_letter)
+
+    # Bump the product counter if outputs for this granule already exist, so this
+    # submission neither clobbers a prior product nor makes a later prefix search
+    # match more than one result. Runs on the CRID-normalized text.
+    runconfig_text = resolve_product_counter(
+        runconfig_text, assume_yes=args.yes, no_bump=args.no_counter_bump,
+        venue=args.venue)
 
     netrc_text = ""
     if os.path.exists(args.netrc):
