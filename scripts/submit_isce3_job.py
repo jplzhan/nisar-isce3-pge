@@ -44,6 +44,7 @@ import os
 import re
 import sys
 
+import requests
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -320,7 +321,14 @@ def resolve_and_build(mozart, version: str) -> dict:
     host = mozart._cfg["host"].rstrip("/")
     url = f"{host}/{PGE_ISCE3_ENDPOINT}"
     log(f"resolving + build/register for VERSION={version} via {url}")
-    resp = mozart._session.post(url, data={"VERSION": version}, timeout=120)
+    # Try SSL-verified first; fall back to unverified on TLS failure (the
+    # cluster's Mozart endpoint may use a self-signed / untrusted cert).
+    try:
+        resp = mozart._session.post(url, data={"VERSION": version}, timeout=120)
+    except requests.exceptions.SSLError as exc:
+        log(f"WARNING: SSL verification failed ({exc}); retrying with verify=False")
+        resp = mozart._session.post(
+            url, data={"VERSION": version}, timeout=120, verify=False)
     # 200 = already built/registered; 202 = build triggered (Accepted).
     if resp.status_code not in (200, 202):
         raise SystemExit(f"PGE build/register failed [{resp.status_code}]: {resp.text}")
