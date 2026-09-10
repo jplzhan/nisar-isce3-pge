@@ -48,45 +48,13 @@ import time
 import requests
 import yaml
 
-# Sibling helper modules (job_records, otello_tls, product_search) live next to
-# this file. Import them robustly no matter how the script was launched: put the
-# script's REAL directory (realpath resolves symlinks; abspath does not) at the
-# front of sys.path, and if a plain import still fails (unusual sys.path, zipped
-# invocation, etc.) load the module directly from its file path as a fallback.
-_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-
-
-def _load_sibling(mod_name):
-    """Import a sibling module by name, falling back to loading it by file path."""
-    try:
-        return __import__(mod_name)
-    except ImportError:
-        import importlib.util
-        path = os.path.join(_SCRIPT_DIR, mod_name + ".py")
-        if not os.path.exists(path):
-            raise ImportError(
-                f"required helper '{mod_name}.py' not found next to "
-                f"{os.path.realpath(__file__)} (looked in {_SCRIPT_DIR}). "
-                f"Keep the scripts/ directory intact -- these modules must sit "
-                f"beside this script."
-            )
-        spec = importlib.util.spec_from_file_location(mod_name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = module
-        spec.loader.exec_module(module)
-        return module
-
-
-_job_records = _load_sibling("job_records")
-make_tag, setup_logging, write_record = (
-    _job_records.make_tag, _job_records.setup_logging, _job_records.write_record)
-_otello_tls = _load_sibling("otello_tls")
-apply_tls, resolve_verify = _otello_tls.apply_tls, _otello_tls.resolve_verify
-_product_search = _load_sibling("product_search")
-find_existing_counters = _product_search.find_existing_counters
-set_product_counter = _product_search.set_product_counter
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from job_records import make_tag, setup_logging, write_record  # noqa: E402
+from otello_tls import apply_tls, resolve_verify  # noqa: E402
+from product_search import (  # noqa: E402
+    find_existing_counters,
+    set_product_counter,
+)
 
 # --------------------------------------------------------------------------- #
 # Defaults
