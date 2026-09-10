@@ -157,16 +157,25 @@ def load_config(path: str = None) -> dict:
 ALLOWED_CRID_LETTERS = ("S", "A")
 CRID_RE = re.compile(r"^[A-Z][0-9]{5}$")
 
+# Runconfig fields whose value carries the CRID and IS output-naming: the CRID
+# field itself and the partial_granule_id (which becomes the output product
+# name). ONLY these are rewritten -- never input paths (reference/secondary RSLC,
+# orbit, TEC, troposphere, DEM ... s3:// URLs), whose embedded token, if it
+# happens to match the CRID, must be preserved verbatim to locate the input.
+CRID_OUTPUT_KEYS = ("composite_release_id", "partial_granule_id")
+
 
 def normalize_crid(runconfig_text: str, allowed_letter: str) -> str:
     """Rewrite the runconfig CRID's leading letter to ``allowed_letter`` if needed.
 
     Reads composite_release_id from runconfig.groups.primary_executable, validates
     it as <1 capital letter><5 digits>, and if its leading letter is not S/A,
-    replaces every occurrence of the token in the raw YAML text (the
-    composite_release_id field AND the partial_granule_id / output name). Operates
-    on raw text to avoid reserializing/reordering the YAML. Raises SystemExit on a
-    missing or malformed CRID.
+    replaces the token ONLY on the output-naming lines (composite_release_id and
+    partial_granule_id -- see CRID_OUTPUT_KEYS). Input paths (reference/secondary
+    RSLC, orbit, TEC, troposphere s3:// URLs) are left untouched even if their
+    filename embeds the same token -- rewriting them would break input lookup.
+    Operates on raw text (line-scoped) to avoid reserializing/reordering the YAML.
+    Raises SystemExit on a missing or malformed CRID.
     """
     cfg = yaml.safe_load(runconfig_text) or {}
     try:
@@ -189,12 +198,23 @@ def normalize_crid(runconfig_text: str, allowed_letter: str) -> str:
         return runconfig_text
 
     new_crid = allowed_letter + old_crid[1:]
-    # Plain substring replace: the CRID is embedded as ..._P05023_... in
-    # partial_granule_id, where a \b word boundary would fail ('_' is a word char).
-    count = runconfig_text.count(old_crid)
-    new_text = runconfig_text.replace(old_crid, new_crid)
-    log(f"composite_release_id {old_crid} -> {new_crid} ({count} occurrence(s) replaced)")
-    return new_text
+    # Line-scoped replace: only rewrite the token on the output-naming key lines,
+    # NOT globally, so input s3:// URLs that embed the same token are preserved.
+    key_re = re.compile(r"^(\s*)(" + "|".join(CRID_OUTPUT_KEYS) + r")(\s*:\s*)")
+    out_lines = []
+    count = 0
+    for line in runconfig_text.splitlines(keepends=True):
+        if key_re.match(line) and old_crid in line:
+            count += line.count(old_crid)
+            line = line.replace(old_crid, new_crid)
+        out_lines.append(line)
+    if count == 0:
+        log(f"WARNING: composite_release_id {old_crid} not found on any of "
+            f"{CRID_OUTPUT_KEYS}; nothing rewritten")
+    else:
+        log(f"composite_release_id {old_crid} -> {new_crid} "
+            f"({count} occurrence(s) replaced on output-naming fields only)")
+    return "".join(out_lines)
 
 
 # --------------------------------------------------------------------------- #
