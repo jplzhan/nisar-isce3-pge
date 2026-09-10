@@ -43,6 +43,7 @@ import argparse
 import os
 import re
 import sys
+import time
 
 import requests
 import yaml
@@ -86,6 +87,16 @@ OTELLO_PKG = os.path.expanduser("~/otello")
 
 # Mozart endpoint that builds/registers the ISCE3 PGE image for a version.
 PGE_ISCE3_ENDPOINT = "mozart/api/v0.1/pge/isce3"
+
+# PGE repo whose branch (the resolved short_hash) is the Jenkins CI job. Used to
+# query the real Jenkins build status via otello.CI.get_build_status().
+PGE_REPO = "https://github.jpl.nasa.gov/NISAR-ODS/nisar-isce3-pge.git"
+
+# Seconds between Jenkins build-status polls when watching an in-progress build.
+BUILD_POLL_SECONDS = 30
+
+# Jenkins build results that count as a completed, successful build.
+BUILD_SUCCESS_RESULTS = {"SUCCESS"}
 
 # Default Mozart private IP is read from an on-demand config object in S3. The
 # bucket is venue-suffixed; try "st" first, then "adt". The object is JSON with a
@@ -340,6 +351,89 @@ def resolve_and_build(mozart, version: str) -> dict:
     return body
 
 
+def classify_build(branch: str) -> dict:
+    """Query the Jenkins build status for ``branch`` ONCE and classify it.
+
+    Uses ``otello.CI.get_build_status()`` (repo=PGE_REPO, branch=<short_hash>),
+    which returns a dict with ``building`` (True while actively running) and
+    ``result`` (SUCCESS/FAILURE/... once done), mirroring alos-to-insar/pcm.py.
+    Collapses that into one of four states the PGE endpoint alone cannot report:
+
+      - "building"   : a build is actively running right now.
+      - "built"      : latest build finished with result SUCCESS.
+      - "failed"     : latest build finished with a non-SUCCESS result.
+      - "not_built"  : no build status available yet (never built / just registered).
+
+    Returns ``{"state": <one of the above>, "result": <str>, "building": <bool>,
+    "url": <str>, "raw": <dict|None>}``. Never raises for a missing build (that is
+    the ``not_built`` state); only unexpected import failures propagate.
+    """
+    otello = _import_otello()
+    ci = otello.CI(repo=PGE_REPO, branch=branch)
+    try:
+        status = ci.get_build_status()
+    except Exception as exc:  # noqa: BLE001 -- no build yet / transient
+        log(f"no build status available for branch {branch} ({exc})")
+        return {"state": "not_built", "result": "", "building": False,
+                "url": "", "raw": None}
+
+    result = str(status.get("result") or "").upper()
+    building = bool(status.get("building"))
+    url = status.get("url") or status.get("build_url") or ""
+    if building:
+        state = "building"
+    elif result in BUILD_SUCCESS_RESULTS:
+        state = "built"
+    elif result:
+        state = "failed"
+    else:
+        state = "not_built"
+    return {"state": state, "result": result, "building": building,
+            "url": url, "raw": status}
+
+
+def report_build_status(branch: str) -> int:
+    """Print the current Jenkins build state for ``branch`` once and return an exit code.
+
+    Exit codes (handy for scripting): 0 built, 1 failed, 2 building, 3 not_built.
+    """
+    info = classify_build(branch)
+    state = info["state"]
+    detail = f"result={info['result'] or '(none)'} building={info['building']}"
+    if info["url"]:
+        detail += f" url={info['url']}"
+    log(f"image build status for branch {branch}: {state.upper()} ({detail})")
+    return {"built": 0, "failed": 1, "building": 2, "not_built": 3}[state]
+
+
+def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS) -> None:
+    """Block until the Jenkins image build for ``branch`` reaches a terminal state.
+
+    Polls ``classify_build`` every ``poll_seconds``:
+      - "building" / "not_built" -> keep polling.
+      - "built"                  -> return.
+      - "failed"                 -> raise SystemExit (no infinite loop).
+
+    Raises SystemExit if the build fails.
+    """
+    log(f"watching Jenkins build for branch {branch} (poll every {poll_seconds}s)...")
+    while True:
+        info = classify_build(branch)
+        state = info["state"]
+        log(f"build status: {state} "
+            f"(result={info['result'] or '(none)'} building={info['building']})")
+        if state == "built":
+            log(f"image build SUCCESS for branch {branch}")
+            return
+        if state == "failed":
+            url = info["url"]
+            raise SystemExit(
+                f"image build for branch {branch} did not succeed "
+                f"(result={info['result'] or 'unknown'}). {('See ' + url) if url else ''}"
+            )
+        time.sleep(poll_seconds)
+
+
 # --------------------------------------------------------------------------- #
 # Mozart submission
 # --------------------------------------------------------------------------- #
@@ -509,6 +603,17 @@ def main() -> int:
     parser.add_argument("--only-build", action="store_true",
                         help="resolve + build/register the image, then exit "
                              "(do not submit a Mozart job)")
+    parser.add_argument("--watch-build", action="store_true",
+                        help="block until the Jenkins image build finishes, polling "
+                             f"the real build status every {BUILD_POLL_SECONDS}s "
+                             "(distinguishes running / success / failure); fails "
+                             "if the build fails; then continue (or exit if "
+                             "--only-build)")
+    parser.add_argument("--build-status", action="store_true",
+                        help="report the current Jenkins image build state ONCE "
+                             "(building / built / failed / not_built) and exit "
+                             "without submitting; exit code 0=built 1=failed "
+                             "2=building 3=not_built")
     parser.add_argument("--skip-build", action="store_true",
                         help="skip the build/register endpoint call; requires --branch")
     parser.add_argument("--branch",
@@ -521,6 +626,20 @@ def main() -> int:
     otello = _import_otello()
     mozart = otello.Mozart()
 
+    # One-shot build-status probe: resolve the branch (short-hash) then report the
+    # current Jenkins state once and exit, without submitting a job. Uses --branch
+    # verbatim if given; otherwise resolves VERSION via the endpoint (which also
+    # registers/triggers a build if none exists).
+    if args.build_status:
+        if args.branch:
+            branch = args.branch
+        else:
+            info = resolve_and_build(mozart, args.version)
+            branch = info.get("short_hash")
+            if not branch:
+                raise SystemExit(f"endpoint returned no short_hash: {info}")
+        return report_build_status(branch)
+
     # 1. Resolve VERSION + ensure the image is built / CI job registered.
     if args.skip_build:
         if not args.branch:
@@ -531,15 +650,23 @@ def main() -> int:
         branch = info.get("short_hash")
         if not branch:
             raise SystemExit(f"endpoint returned no short_hash: {info}")
+        already = info.get("status") == "already_built"
+        if args.watch_build and not already:
+            # Endpoint triggered/registered the build; block on the real Jenkins
+            # status (running -> success/failure) instead of re-polling the
+            # endpoint's coarse built/not-built flag.
+            watch_build(branch)
+            already = True
         if args.only_build:
             log(f"--only-build set; version {args.version} -> {branch} "
-                f"({info.get('status')}); done")
+                f"({'already_built' if already else info.get('status')}); done")
             return 0
-        if info.get("status") != "already_built":
+        if not already:
             raise SystemExit(
                 f"image for {args.version} ({branch}) not ready yet "
                 f"(status={info.get('status')}). Re-run once the build completes, "
-                f"or use --skip-build --branch {branch} to submit anyway."
+                f"use --watch-build to block until it finishes, or "
+                f"--skip-build --branch {branch} to submit anyway."
             )
 
     # 2. Submit the PGE job with the runconfig inline.
