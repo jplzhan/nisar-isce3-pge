@@ -45,6 +45,7 @@ from job_records import (  # noqa: E402
     load_record,
     setup_logging,
 )
+from otello_tls import apply_tls, resolve_verify  # noqa: E402
 
 from product_search import (  # noqa: E402
     expected_s3_prefix,
@@ -290,6 +291,14 @@ def main() -> int:
                         help="on failure, dump the full worker traceback")
     parser.add_argument("--list", action="store_true",
                         help="list known job records (newest first) and exit")
+    parser.add_argument("--ca-cert",
+                        help="CA bundle (PEM) for TLS verification of the Mozart "
+                             "endpoint. If omitted, uses REQUESTS_CA_BUNDLE/"
+                             "SSL_CERT_FILE, else auto-downloads the server's full "
+                             "cert chain and verifies against it.")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="force INSECURE requests (verify=False), disabling all "
+                             "TLS verification. Not recommended.")
     args = parser.parse_args()
 
     if args.list:
@@ -304,6 +313,15 @@ def main() -> int:
 
     otello = _import_otello()
     mozart = otello.Mozart()
+
+    # Apply proper TLS verification to the shared otello session (explicit
+    # --ca-cert > env bundle > auto-downloaded full chain). The Job resolved
+    # below reuses mozart._session, so it inherits this verify setting.
+    verify, tls_mode = resolve_verify(
+        args.ca_cert, mozart._cfg.get("host", ""),
+        no_verify=args.no_verify, log=logger.info)
+    logger.info(f"TLS verify mode: {tls_mode}")
+    apply_tls(mozart, verify)
 
     job, record = resolve_job(otello, mozart, args)
     if job is None:

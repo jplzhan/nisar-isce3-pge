@@ -50,6 +50,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from job_records import make_tag, setup_logging, write_record  # noqa: E402
+from otello_tls import apply_tls, resolve_verify  # noqa: E402
 from product_search import (  # noqa: E402
     find_existing_counters,
     set_product_counter,
@@ -340,24 +341,34 @@ def queue_for_runconfig(runconfig_text: str, config: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Build / register via the Mozart PGE endpoint
 # --------------------------------------------------------------------------- #
-def resolve_and_build(mozart, version: str) -> dict:
+def resolve_and_build(mozart, version: str, allow_insecure_fallback: bool = True) -> dict:
     """Resolve VERSION + build/register the ISCE3 PGE image via the Mozart endpoint.
 
     The endpoint resolves VERSION (branch/tag/commit) to the ISCE3 hash, forwards
     it to the Jenkins CI machine, and reports registration/build status (or
-    triggers a rebuild). Reuses otello's session so host, auth, and TLS settings
-    come from ~/.config/otello/config.yml. Returns the parsed JSON response, which
-    includes `short_hash` (the branch of the registered job) and `status`.
+    triggers a rebuild). Reuses otello's session (its ``verify`` is set by
+    ``apply_tls`` in ``main``) so host, auth, and TLS settings are shared.
+    Returns the parsed JSON response, which includes `short_hash` and `status`.
+
+    ``allow_insecure_fallback``: when True and no CA bundle was resolved (mode
+    "none"), a TLS failure is retried once with ``verify=False`` (legacy behavior,
+    logged as a WARNING). When False (a real bundle is in use), a TLS failure is a
+    hard error -- we do NOT silently drop verification.
     """
     host = mozart._cfg["host"].rstrip("/")
     url = f"{host}/{PGE_ISCE3_ENDPOINT}"
     log(f"resolving + build/register for VERSION={version} via {url}")
-    # Try SSL-verified first; fall back to unverified on TLS failure (the
-    # cluster's Mozart endpoint may use a self-signed / untrusted cert).
     try:
         resp = mozart._session.post(url, data={"VERSION": version}, timeout=120)
     except requests.exceptions.SSLError as exc:
-        log(f"WARNING: SSL verification failed ({exc}); retrying with verify=False")
+        if not allow_insecure_fallback:
+            raise SystemExit(
+                f"TLS verification of {url} failed against the configured CA "
+                f"bundle: {exc}. Fix --ca-cert / the endpoint cert; refusing to "
+                f"fall back to an unverified connection."
+            )
+        log(f"WARNING: SSL verification failed ({exc}); retrying INSECURELY with "
+            f"verify=False (no CA bundle available)")
         resp = mozart._session.post(
             url, data={"VERSION": version}, timeout=120, verify=False)
     # 200 = already built/registered; 202 = build triggered (Accepted).
@@ -371,7 +382,7 @@ def resolve_and_build(mozart, version: str) -> dict:
     return body
 
 
-def classify_build(branch: str) -> dict:
+def classify_build(branch: str, verify=None) -> dict:
     """Query the Jenkins build status for ``branch`` ONCE and classify it.
 
     Uses ``otello.CI.get_build_status()`` (repo=PGE_REPO, branch=<short_hash>),
@@ -384,12 +395,16 @@ def classify_build(branch: str) -> dict:
       - "failed"     : latest build finished with a non-SUCCESS result.
       - "not_built"  : no build status available yet (never built / just registered).
 
+    ``verify``: CA bundle path applied to the CI session for real TLS verification
+    (CI does not accept ssl_verify in its constructor, so we set it after).
+
     Returns ``{"state": <one of the above>, "result": <str>, "building": <bool>,
     "url": <str>, "raw": <dict|None>}``. Never raises for a missing build (that is
     the ``not_built`` state); only unexpected import failures propagate.
     """
     otello = _import_otello()
     ci = otello.CI(repo=PGE_REPO, branch=branch)
+    apply_tls(ci, verify)
     try:
         status = ci.get_build_status()
     except Exception as exc:  # noqa: BLE001 -- no build yet / transient
@@ -412,12 +427,12 @@ def classify_build(branch: str) -> dict:
             "url": url, "raw": status}
 
 
-def report_build_status(branch: str) -> int:
+def report_build_status(branch: str, verify=None) -> int:
     """Print the current Jenkins build state for ``branch`` once and return an exit code.
 
     Exit codes (handy for scripting): 0 built, 1 failed, 2 building, 3 not_built.
     """
-    info = classify_build(branch)
+    info = classify_build(branch, verify=verify)
     state = info["state"]
     detail = f"result={info['result'] or '(none)'} building={info['building']}"
     if info["url"]:
@@ -426,7 +441,7 @@ def report_build_status(branch: str) -> int:
     return {"built": 0, "failed": 1, "building": 2, "not_built": 3}[state]
 
 
-def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS) -> None:
+def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS, verify=None) -> None:
     """Block until the Jenkins image build for ``branch`` reaches a terminal state.
 
     Polls ``classify_build`` every ``poll_seconds``:
@@ -434,11 +449,13 @@ def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS) -> None:
       - "built"                  -> return.
       - "failed"                 -> raise SystemExit (no infinite loop).
 
+    ``verify``: CA bundle path forwarded to ``classify_build`` for TLS verification.
+
     Raises SystemExit if the build fails.
     """
     log(f"watching Jenkins build for branch {branch} (poll every {poll_seconds}s)...")
     while True:
-        info = classify_build(branch)
+        info = classify_build(branch, verify=verify)
         state = info["state"]
         log(f"build status: {state} "
             f"(result={info['result'] or '(none)'} building={info['building']})")
@@ -639,12 +656,32 @@ def main() -> int:
     parser.add_argument("--branch",
                         help="job branch/short-hash to submit against when --skip-build "
                              "is set (bypasses version resolution)")
+    parser.add_argument("--ca-cert",
+                        help="CA bundle (PEM) for TLS verification of the Mozart / "
+                             "Jenkins endpoints. If omitted, uses REQUESTS_CA_BUNDLE/"
+                             "SSL_CERT_FILE, else auto-downloads the server's full "
+                             "cert chain and verifies against it. With --ca-cert a "
+                             "TLS failure is a hard error (no insecure fallback).")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="force INSECURE requests (verify=False), disabling all "
+                             "TLS verification. Not recommended; exposes credentials.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
 
     otello = _import_otello()
     mozart = otello.Mozart()
+
+    # Resolve the TLS verify value ONCE (explicit --ca-cert > env bundle >
+    # auto-downloaded full chain > none) and apply it to the shared otello session.
+    # mode "none" means nothing usable was resolved -> insecure fallback is allowed
+    # in resolve_and_build; any real bundle makes TLS failures a hard error.
+    verify, tls_mode = resolve_verify(
+        args.ca_cert, mozart._cfg.get("host", ""),
+        no_verify=args.no_verify, log=log)
+    log(f"TLS verify mode: {tls_mode}")
+    apply_tls(mozart, verify)
+    allow_insecure_fallback = tls_mode in ("none", "forced_insecure")
 
     # One-shot build-status probe: resolve the branch (short-hash) then report the
     # current Jenkins state once and exit, without submitting a job. Uses --branch
@@ -654,11 +691,12 @@ def main() -> int:
         if args.branch:
             branch = args.branch
         else:
-            info = resolve_and_build(mozart, args.version)
+            info = resolve_and_build(mozart, args.version,
+                                     allow_insecure_fallback=allow_insecure_fallback)
             branch = info.get("short_hash")
             if not branch:
                 raise SystemExit(f"endpoint returned no short_hash: {info}")
-        return report_build_status(branch)
+        return report_build_status(branch, verify=verify)
 
     # 1. Resolve VERSION + ensure the image is built / CI job registered.
     if args.skip_build:
@@ -666,7 +704,8 @@ def main() -> int:
             raise SystemExit("--skip-build requires --branch <short-hash>")
         branch = args.branch
     else:
-        info = resolve_and_build(mozart, args.version)
+        info = resolve_and_build(mozart, args.version,
+                                 allow_insecure_fallback=allow_insecure_fallback)
         branch = info.get("short_hash")
         if not branch:
             raise SystemExit(f"endpoint returned no short_hash: {info}")
@@ -675,7 +714,7 @@ def main() -> int:
             # Endpoint triggered/registered the build; block on the real Jenkins
             # status (running -> success/failure) instead of re-polling the
             # endpoint's coarse built/not-built flag.
-            watch_build(branch)
+            watch_build(branch, verify=verify)
             already = True
         if args.only_build:
             log(f"--only-build set; version {args.version} -> {branch} "
