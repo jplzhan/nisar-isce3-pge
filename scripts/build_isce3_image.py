@@ -34,7 +34,7 @@ import tempfile
 from urllib.parse import urlparse, urlunparse
 
 ISCE3_REPO = "https://github.com/isce-framework/isce3.git"
-DEFAULT_PGE_REPO = "https://github.jpl.nasa.gov/NISAR-ODS/nisar-isce3-pge.git"
+DEFAULT_PGE_REPO = "https://github.com/jplzhan/nisar-isce3-pge.git"
 DOCKERFILE_REL = "docker/Dockerfile"
 # Matches the pinned ISCE3 commit in the Dockerfile, e.g.
 #   --commit-hash 3383442fee8d2003f5066fffe37bda9de63a8ed2 \

@@ -91,10 +91,14 @@ PGE_ISCE3_ENDPOINT = "mozart/api/v0.1/pge/isce3"
 
 # PGE repo whose branch (the resolved short_hash) is the Jenkins CI job. Used to
 # query the real Jenkins build status via otello.CI.get_build_status().
-PGE_REPO = "https://github.jpl.nasa.gov/NISAR-ODS/nisar-isce3-pge.git"
+PGE_REPO = "https://github.com/jplzhan/nisar-isce3-pge.git"
 
 # Seconds between Jenkins build-status polls when watching an in-progress build.
 BUILD_POLL_SECONDS = 30
+
+# Consecutive "jenkins job not found" polls tolerated (the job may still be
+# registering right after the endpoint call) before watch_build gives up.
+BUILD_MISSING_GRACE_POLLS = 5
 
 # Jenkins build results that count as a completed, successful build.
 BUILD_SUCCESS_RESULTS = {"SUCCESS"}
@@ -394,13 +398,14 @@ def classify_build(branch: str, verify=None) -> dict:
       - "built"      : latest build finished with result SUCCESS.
       - "failed"     : latest build finished with a non-SUCCESS result.
       - "not_built"  : no build status available yet (never built / just registered).
+      - "missing"    : Mozart reports no Jenkins job for PGE_REPO + ``branch``.
 
     ``verify``: CA bundle path applied to the CI session for real TLS verification
     (CI does not accept ssl_verify in its constructor, so we set it after).
 
     Returns ``{"state": <one of the above>, "result": <str>, "building": <bool>,
     "url": <str>, "raw": <dict|None>}``. Never raises for a missing build (that is
-    the ``not_built`` state); only unexpected import failures propagate.
+    the ``not_built`` / ``missing`` state); only unexpected import failures propagate.
     """
     otello = _import_otello()
     ci = otello.CI(repo=PGE_REPO, branch=branch)
@@ -409,7 +414,8 @@ def classify_build(branch: str, verify=None) -> dict:
         status = ci.get_build_status()
     except Exception as exc:  # noqa: BLE001 -- no build yet / transient
         log(f"no build status available for branch {branch} ({exc})")
-        return {"state": "not_built", "result": "", "building": False,
+        state = "missing" if "jenkins job not found" in str(exc) else "not_built"
+        return {"state": state, "result": "", "building": False,
                 "url": "", "raw": None}
 
     result = str(status.get("result") or "").upper()
@@ -430,7 +436,8 @@ def classify_build(branch: str, verify=None) -> dict:
 def report_build_status(branch: str, verify=None) -> int:
     """Print the current Jenkins build state for ``branch`` once and return an exit code.
 
-    Exit codes (handy for scripting): 0 built, 1 failed, 2 building, 3 not_built.
+    Exit codes (handy for scripting): 0 built, 1 failed, 2 building, 3 not_built,
+    4 missing.
     """
     info = classify_build(branch, verify=verify)
     state = info["state"]
@@ -438,7 +445,7 @@ def report_build_status(branch: str, verify=None) -> int:
     if info["url"]:
         detail += f" url={info['url']}"
     log(f"image build status for branch {branch}: {state.upper()} ({detail})")
-    return {"built": 0, "failed": 1, "building": 2, "not_built": 3}[state]
+    return {"built": 0, "failed": 1, "building": 2, "not_built": 3, "missing": 4}[state]
 
 
 def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS, verify=None) -> None:
@@ -448,12 +455,15 @@ def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS, verify=None
       - "building" / "not_built" -> keep polling.
       - "built"                  -> return.
       - "failed"                 -> raise SystemExit (no infinite loop).
+      - "missing"                -> keep polling for up to BUILD_MISSING_GRACE_POLLS
+                                    consecutive polls, then raise SystemExit.
 
     ``verify``: CA bundle path forwarded to ``classify_build`` for TLS verification.
 
-    Raises SystemExit if the build fails.
+    Raises SystemExit if the build fails or its Jenkins job never appears.
     """
     log(f"watching Jenkins build for branch {branch} (poll every {poll_seconds}s)...")
+    missing_polls = 0
     while True:
         info = classify_build(branch, verify=verify)
         state = info["state"]
@@ -468,6 +478,16 @@ def watch_build(branch: str, poll_seconds: int = BUILD_POLL_SECONDS, verify=None
                 f"image build for branch {branch} did not succeed "
                 f"(result={info['result'] or 'unknown'}). {('See ' + url) if url else ''}"
             )
+        if state == "missing":
+            missing_polls += 1
+            if missing_polls >= BUILD_MISSING_GRACE_POLLS:
+                raise SystemExit(
+                    f"Jenkins job not found for repo {PGE_REPO} branch {branch} "
+                    f"after {missing_polls} polls; the build is not registered "
+                    f"under this repo."
+                )
+        else:
+            missing_polls = 0
         time.sleep(poll_seconds)
 
 
@@ -648,9 +668,9 @@ def main() -> int:
                              "--only-build)")
     parser.add_argument("--build-status", action="store_true",
                         help="report the current Jenkins image build state ONCE "
-                             "(building / built / failed / not_built) and exit "
-                             "without submitting; exit code 0=built 1=failed "
-                             "2=building 3=not_built")
+                             "(building / built / failed / not_built / missing) "
+                             "and exit without submitting; exit code 0=built "
+                             "1=failed 2=building 3=not_built 4=missing")
     parser.add_argument("--skip-build", action="store_true",
                         help="skip the build/register endpoint call; requires --branch")
     parser.add_argument("--branch",
